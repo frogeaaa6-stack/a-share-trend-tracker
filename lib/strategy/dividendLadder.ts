@@ -455,17 +455,25 @@ export function evaluateEnhancedDividendLadder(
   const sellCap = distance >= -.01 ? .5 : distance >= -.06 ? .75 : 1;
   const riskCap = distance <= -.18 ? .5 : slope20 < -.02 ? .75 : 1;
   let candidate = Math.max(normalizedPosition, durationBuyFloor);
-  if (candidate > normalizedPosition + .0001) candidate = Math.min(candidate, factorCap);
+  if (candidate > normalizedPosition + .0001) candidate = Math.max(normalizedPosition, Math.min(candidate, factorCap));
   const beforeVolatilityCap = candidate;
   if (volatilityGuardEnabled) candidate = applyNewTacticalVolatilityCap(normalizedPosition, candidate, volatilityCap);
   let target = Math.min(candidate, sellCap, riskCap);
   if (durationBuyFloor > normalizedPosition + .0001 && factorCap < durationBuyFloor) {
-    pendingRules.push(`股息利差上限限制新增机动仓：当前最多 ${Math.round(factorCap * 100)}%`);
+    pendingRules.push(factorCap < normalizedPosition
+      ? `股息利差许可上限 ${Math.round(factorCap * 100)}%，仅阻止新增，已有 ${Math.round(normalizedPosition * 100)}% 保持`
+      : `股息利差上限限制新增机动仓：新增最多 ${Math.round(factorCap * 100)}%`);
   } else {
     matchedRules.push(`股息利差上限允许最高 ${Math.round(factorCap * 100)}% 仓位`);
   }
   if (volatilityGuardEnabled && beforeVolatilityCap > candidate + .0001) {
-    pendingRules.push(`波动率分位上限限制新增机动仓：当前最多 ${Math.round(volatilityCap * 100)}%（分位 ${(volatilityPoint.percentile! * 100).toFixed(1)}%）`);
+    pendingRules.push(volatilityPoint.ready && volatilityPoint.percentile !== null
+      ? volatilityCap < normalizedPosition
+        ? `波动率分位许可上限 ${Math.round(volatilityCap * 100)}%，仅阻止新增，已有 ${Math.round(normalizedPosition * 100)}% 保持（分位 ${(volatilityPoint.percentile * 100).toFixed(1)}%）`
+        : `波动率分位上限限制新增机动仓：新增最多 ${Math.round(volatilityCap * 100)}%（分位 ${(volatilityPoint.percentile * 100).toFixed(1)}%）`
+      : volatilityCap < normalizedPosition
+        ? `波动率历史不足/未就绪：许可上限 ${Math.round(volatilityCap * 100)}%，仅阻止新增，已有 ${Math.round(normalizedPosition * 100)}% 保持`
+        : `波动率历史不足/未就绪：新增机动仓暂最多 ${Math.round(volatilityCap * 100)}%`);
   } else if (volatilityGuardEnabled && candidate > normalizedPosition + .0001 && candidate > .5) {
     matchedRules.push(`波动率护栏通过：新增机动仓上限 ${Math.round(volatilityCap * 100)}%`);
   } else if (!volatilityGuardEnabled) {

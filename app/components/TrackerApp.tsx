@@ -433,11 +433,6 @@ function recentMa250DistanceFloor(bars: Point[], days = 3) {
   });
   return distances.some((value) => value === null) ? null : Math.min(...distances as number[]);
 }
-function confirmationDate(bars: Point[], start: string) {
-  const index = bars.findIndex((bar) => bar.date === start);
-  return index < 0 ? "—" : bars[Math.min(bars.length - 1, index + 2)]?.date ?? "—";
-}
-
 async function fetchLadderFactors(): Promise<FactorSnapshot> {
   const response = await fetch("/api/factors/dividend-ladder", { cache: "no-store" });
   const body = await response.json() as FactorSnapshot & { error?: string };
@@ -626,6 +621,14 @@ function DividendLadderModule() {
   const regime = useMemo(() => computePriceVolatilityRegimes(bars, factorHistoryPoints), [bars, factorHistoryPoints]);
   const latestRegimePoint = regime.points.at(-1) ?? null;
   const shadowRisk = useMemo(() => computePriceVolatilityShadowRisk(bars), [bars]);
+  const v5TradeDifference = report.volatilityGuarded.trades - report.enhanced.trades;
+  const v5TradeObservation = v5TradeDifference < 0
+    ? `少 ${Math.abs(v5TradeDifference)} 笔交易${Math.abs(v5TradeDifference) % 2 === 0 ? `（即少 ${Math.abs(v5TradeDifference) / 2} 笔折返）` : ""}`
+    : v5TradeDifference > 0 ? `多 ${v5TradeDifference} 笔交易` : "交易数相同";
+  const v5OutcomeObservation = report.volatilityGuarded.total < report.enhanced.total && report.volatilityGuarded.maxDrawdown < report.enhanced.maxDrawdown
+    ? "收益略低且最大回撤未改善"
+    : report.volatilityGuarded.total < report.enhanced.total ? "收益较低"
+      : report.volatilityGuarded.maxDrawdown < report.enhanced.maxDrawdown ? "最大回撤未改善" : "结果与 v4 的差异需结合样本复核";
   const effectiveTradeDate = tradeDraft.tradeDate || view?.asOf || "";
   const currentFraction = strategyPositionPercent / 100;
   const executionTarget = decision.target === null
@@ -826,7 +829,7 @@ function DividendLadderModule() {
         <div><span>指数股息率 D/P2</span><b>{naturalPercent(decision.dividendYield)}</b><small>{factors ? `中证 H30269 官方 · ${factors.dividend.date}` : "因子暂不可用"}</small></div>
         <div><span>十年国债收益率</span><b>{naturalPercent(decision.governmentBond10Y, 3)}</b><small>{factors ? `中债官方 · ${factors.rate.date}` : "因子暂不可用"}</small></div>
         <div><span>股息—国债利差</span><b>{naturalPercent(decision.dividendSpread, 2)}</b><small>{factors?.rate.verified ? `新浪同日核验 · 差 ${factors.rate.differenceBps?.toFixed(2)} bp` : "等待同日次源核验"}</small></div>
-        <div><span>利差允许总仓位</span><b>{decision.ready ? `${Math.round(decision.factorCap * 100)}%` : "—"}</b><small>{decision.factorMode === "strict" ? "只限制机动仓新增，不触发卖出" : decision.factorMode === "degraded" ? "缺失或未核验时最多 75%" : "历史回测未使用该因子"}</small></div>
+        <div><span>利差新增许可上限</span><b>{decision.ready ? `${Math.round(decision.factorCap * 100)}%` : "—"}</b><small>{currentFraction > decision.factorCap ? "仅阻止新增，已有仓位保持；不会为回到上限而卖出" : decision.factorMode === "strict" ? "只限制机动仓新增，不触发卖出" : decision.factorMode === "degraded" ? "缺失或未核验时限制新增至最多 75%" : "历史回测未使用该因子"}</small></div>
       </div>
       <section className="ladder-history" aria-label="三指标历史位置">
         <div className="ladder-history-head"><div><p className="eyebrow">HISTORICAL POSITION / EVIDENCE FIRST</p><h3>三指标历史位置</h3></div><small>只使用真实观测；分位均为当时可得历史的点时分位。</small></div>
@@ -838,12 +841,12 @@ function DividendLadderModule() {
       </section>
       <section className="ladder-regimes" aria-label="历史低估与压力区间">
         <div className="ladder-history-head"><div><p className="eyebrow">HISTORICAL REGIMES</p><h3>历史低估与压力区间</h3></div><small>{regime.jointStatesEnabled ? "联合低估样本已满足最低覆盖要求。" : `联合低估：证据不足（股息利差仅 ${factorHistory?.coverage.sameDaySpreadObservations ?? 0} / 252 个真实同日观测），不生成联合低估。`}</small></div>
-        <div className="regime-table"><Table><thead><tr><th>类型</th><th>开始</th><th>确认</th><th>结束 / 进行中</th><th>持续日</th><th>完整性</th></tr></thead><tbody>{regime.intervals.length ? regime.intervals.slice(-8).reverse().map((interval, index) => <tr key={`${interval.state}-${interval.start}-${index}`}><td>{interval.state === "price-deep-low" ? "价格深度低位" : interval.state === "price-low" ? "价格低位" : "波动压力"}</td><td>{interval.start}</td><td>{confirmationDate(bars, interval.start)}（连续 3 日）</td><td>{interval.end === bars.at(-1)?.date ? "进行中" : interval.end}</td><td>{interval.qualifyingDays} 日</td><td>{regime.jointStatesEnabled ? "价格 / 波动率完整" : "联合低估证据不足"}</td></tr>) : <tr><td className="empty" colSpan={6}>尚无达到确认门槛的价格低位、深度低位或波动压力区间。</td></tr>}</tbody></Table></div>
+        <div className="regime-table"><Table><thead><tr><th>类型</th><th>开始</th><th>确认</th><th>结束 / 进行中</th><th>持续日</th><th>完整性</th></tr></thead><tbody>{regime.intervals.length ? regime.intervals.slice(-8).reverse().map((interval, index) => <tr key={`${interval.state}-${interval.start}-${index}`}><td>{interval.state === "price-deep-low" ? "价格深度低位" : interval.state === "price-low" ? "价格低位" : "波动压力"}</td><td>{interval.start}</td><td>{interval.confirmedAt}</td><td>{interval.closedAt ? `${interval.endDate}（${interval.closedAt} 确认结束）` : "进行中"}</td><td>{interval.qualifyingDays} 日</td><td>{interval.incomplete ? "数据缺口，区间不完整" : regime.jointStatesEnabled ? "价格 / 波动率完整" : "联合低估证据不足"}</td></tr>) : <tr><td className="empty" colSpan={6}>尚无达到确认门槛的价格低位、深度低位或波动压力区间。</td></tr>}</tbody></Table></div>
       </section>
       <section className={`ladder-shadow ${shadowRisk.riskBand}`} aria-label="未来跌破年线风险">
         <div><p className="eyebrow">SHADOW OBSERVATION / PRICE + VOLATILITY</p><h3>未来跌破年线风险</h3><p>双因子（价格＋波动率）影子观察；研究观察，不改变实盘仓位，不发送飞书。</p></div>
-        <div><span>风险带</span><b>{shadowRisk.riskBand === "high" ? "高" : shadowRisk.riskBand === "elevated" ? "关注" : "低"}</b><small>{shadowRisk.status}</small></div>
-        <div><span>主要因素</span><b>{shadowRisk.primaryFactor === "distance" ? "价格 / 年线偏离" : "波动率分位"}</b><small>{decision.distance !== null && decision.distance < 0 ? "已处年线下，使用现有仓位管理。" : "当前未处年线下。"}</small></div>
+        <div><span>风险带</span><b>{shadowRisk.riskBand === "already-below" ? "已在年线下" : shadowRisk.riskBand === "high" ? "高" : shadowRisk.riskBand === "elevated" ? "关注" : shadowRisk.riskBand === "unavailable" ? "不可用" : "低"}</b><small>{shadowRisk.status}</small></div>
+        <div><span>主要因素</span><b>{shadowRisk.primaryFactor === "distance" ? "价格 / 年线偏离" : shadowRisk.primaryFactor === "volatility-percentile" ? "波动率分位" : "—"}</b><small>{shadowRisk.riskBand === "already-below" ? "已处年线下，使用现有仓位管理。" : "当前未处年线下。"}</small></div>
         <div><span>概率</span><b>{shadowRisk.probability === null ? "不可用" : naturalPercent(shadowRisk.probability, 1)}</b><small>当前没有足够、经验证的标签样本供概率估计。</small></div>
       </section>
       <div className="ladder-amounts"><div><span>战略目标档位 / 固定预算</span><b>{decision.target === null || targetValue === null ? "—" : `${Math.round(decision.target * 100)}% · ${cash(targetValue)}`}</b></div><div><span>本批预算档位变动（最多 25%）</span><b className={deltaValue !== null && deltaValue < 0 ? "red" : "green"}>{deltaValue === null ? "—" : `${deltaValue >= 0 ? "新增预算约 " : "减少持仓成本约 "}${cash(Math.abs(deltaValue))}`}</b></div><div><span>本批估算 100 份整手 / 市值</span><b>{decision.target === null ? "—" : `${lots} 手 · ${cash(estimatedExecutionCash)}`}</b></div></div>
@@ -853,10 +856,10 @@ function DividendLadderModule() {
         <div className={threeDayDistanceFloor !== null && threeDayDistanceFloor >= .05 ? "watching" : ""}><span>人工观察 · 核心止盈</span><b>{coreProfitObservation}</b><small>回测中 50%→35% 有改善，但历史股息利差未补齐，暂不自动下结论或发送卖出指令。</small></div>
         <div className={decision.distance !== null && decision.distance <= -.18 ? "risk" : ""}><span>风险减仓</span><b>{decision.distance !== null && decision.distance <= -.18 ? "已触发：停止摊低，高于 50% 的部分回到核心仓" : "距 MA250 ≤ -18% 时停止摊低并回到 50%"}</b><small>这是极端风险控制，不是“越跌越卖”核心仓。</small></div>
       </div>
-      <details className="ladder-policy"><summary>查看完整策略执行顺序</summary><ol><li>新策略从所选起始交易日计时，核心仓按 20% → 35% → 50% 三档完成；每次只进入下一档。</li><li>价格达到对应偏离与连续跌破门槛时可提前买入；未达到时分别在第 21 / 63 / 126 日尝试，并在第 63 / 105 / 168 日硬截止。</li><li>若较近 20 日低点反弹至少 6%，且当前仍高于年线下 3%，暂停非强制核心仓买入；硬截止优先于反弹过滤。</li><li>50% 核心仓完成后，才按价格与持续时间生成 75% / 100% 机动仓候选。</li><li>股息率减十年国债收益率只限制新增机动仓：低于 1.5 个百分点最多 50%，1.5–3.0 最多 75%，不低于 3.0 最多 100%。</li><li>机动仓还要通过双源数据、MA250 斜率、连续 5 日修复、两日止跌和放量长阴护栏。</li><li>回升至年线下 6%收回至 75%，回升至年线下 1%收回至 50%；利差下降本身不触发卖出。</li><li>偏离达到 -18%时停止摊低并回到 50%核心仓；当前执行仍是 T 日收盘确认、T+1 开盘人工执行。</li></ol></details>
+      <details className="ladder-policy"><summary>查看完整策略执行顺序</summary><ol><li>新策略从所选起始交易日计时，核心仓按 20% → 35% → 50% 三档完成；每次只进入下一档。</li><li>价格达到对应偏离与连续跌破门槛时可提前买入；未达到时分别在第 21 / 63 / 126 日尝试，并在第 63 / 105 / 168 日硬截止。</li><li>若较近 20 日低点反弹至少 6%，且当前仍高于年线下 3%，暂停非强制核心仓买入；硬截止优先于反弹过滤。</li><li>50% 核心仓完成后，才按价格与持续时间生成 75% / 100% 机动仓候选。</li><li>股息率减十年国债收益率只限制新增机动仓：低于 1.5 个百分点最多 50%，1.5–3.0 最多 75%，不低于 3.0 最多 100%。</li><li>波动率分位只限制新增机动仓：低于 75% 最多 100%，75% 至 90% 最多 75%，不低于 90% 最多 50%；不触发卖出。</li><li>机动仓还要通过双源数据、MA250 斜率、连续 5 日修复、两日止跌和放量长阴护栏。</li><li>回升至年线下 6%收回至 75%，回升至年线下 1%收回至 50%；利差下降本身不触发卖出。</li><li>偏离达到 -18%时停止摊低并回到 50%核心仓；当前执行仍是 T 日收盘确认、T+1 开盘人工执行。</li></ol></details>
       <div className="ladder-guards"><b>服务器会同时报告已命中与尚未命中的条件</b><p><strong>已命中：</strong>{decision.matchedRules.length ? decision.matchedRules.join("；") : "暂无"}</p><p><strong>待命 / 阻挡：</strong>{decision.pendingRules.length || decision.gates.length ? [...new Set([...decision.pendingRules, ...decision.gates])].join("；") : "无"}</p><small>当前 MA250 20 日斜率为 {ladderPercent(decision.slope20)}。冷启动核心仓不靠追涨；核心仓完成后，机动仓才使用股息利差与趋势修复护栏。</small></div>
       <div className={`ladder-notify ${feishu?.configured ? "ready" : ""}`}><div><b>飞书策略提醒</b><p>{feishuMessage}</p><small>买入一级黄色、核心加仓橙色、机动重仓红色；卖出一级浅蓝、卖出二级青绿；等待灰色、人工复核紫色。正式买入与卖出都由服务器用实盘账本和已验证行情复算后发送。</small></div><button type="button" onClick={() => void testFeishu()} disabled={!feishu?.configured || testingFeishu}>{testingFeishu ? "发送中…" : "发送完整测试消息"}</button></div>
-      {report.ready && <div className="ladder-backtest"><div><b>混合冷启动 v4（当前）</b><span>总收益 {percent(report.enhanced.total)} · 年化 {percent(report.enhanced.annual)} · 最大回撤 {percent(report.enhanced.maxDrawdown)} · {report.enhanced.trades} 笔</span></div>{report.volatilityGuarded && <div><b>v5（波动率限制新增机动仓）</b><span>总收益 {percent(report.volatilityGuarded.total)} · 年化 {percent(report.volatilityGuarded.annual)} · 最大回撤 {percent(report.volatilityGuarded.maxDrawdown)} · {report.volatilityGuarded.trades} 笔</span></div>}<div><b>立即 50% 核心仓（对照）</b><span>总收益 {percent(report.immediateCore.total)} · 年化 {percent(report.immediateCore.annual)} · 最大回撤 {percent(report.immediateCore.maxDrawdown)} · {report.immediateCore.trades} 笔</span></div><div><b>同期买入并持有</b><span>总收益 {percent(report.buyHold.total)} · 年化 {percent(report.buyHold.annual)} · 最大回撤 {percent(report.buyHold.maxDrawdown)}</span></div><p>回测本金固定 50,000 元，按 T 日收盘决策、T+1 开盘执行、单边 8 bps、100 份整手计算。历史股息利差序列不完整，未倒填当前利差；滚动窗口审计显示，冷启动主要换取更小的入场回撤，并非稳定提高收益。</p>{report.shortSample && <p>样本仅 {report.usableBars} 个可用交易日，少于 750 日；结果仅作短样本规则检查，不宜据此推断长期表现。</p>}</div>}
+      {report.ready && <div className="ladder-backtest"><div><b>混合冷启动 v4（对照）</b><span>总收益 {percent(report.enhanced.total)} · 年化 {percent(report.enhanced.annual)} · 最大回撤 {percent(report.enhanced.maxDrawdown)} · {report.enhanced.trades} 笔</span></div><div><b>v5（当前 · 波动率限制新增机动仓）</b><span>总收益 {percent(report.volatilityGuarded.total)} · 年化 {percent(report.volatilityGuarded.annual)} · 最大回撤 {percent(report.volatilityGuarded.maxDrawdown)} · {report.volatilityGuarded.trades} 笔</span></div><div><b>立即 50% 核心仓（对照）</b><span>总收益 {percent(report.immediateCore.total)} · 年化 {percent(report.immediateCore.annual)} · 最大回撤 {percent(report.immediateCore.maxDrawdown)} · {report.immediateCore.trades} 笔</span></div><div><b>同期买入并持有</b><span>总收益 {percent(report.buyHold.total)} · 年化 {percent(report.buyHold.annual)} · 最大回撤 {percent(report.buyHold.maxDrawdown)}</span></div><p>回测本金固定 50,000 元，按 T 日收盘决策、T+1 开盘执行、单边 8 bps、100 份整手计算。当前样本 v5 {v5TradeObservation}；{v5OutcomeObservation}，不以此宣称收益增强。历史股息利差序列不完整，未倒填当前利差。</p>{report.shortSample && <p>样本仅 {report.usableBars} 个可用交易日，少于 750 日；结果仅作短样本规则检查，不宜据此推断长期表现。</p>}</div>}
     </div>
   </section>;
 }

@@ -65,6 +65,16 @@ export type ShadowRiskResult = {
   labels: DurableBreakLabel[];
 };
 
+export function assessPriceVolatilityRisk(distance: number | null, volatilityPercentile: number | null) {
+  if (distance === null || volatilityPercentile === null) return { riskBand: "unavailable" as const, primaryFactor: null };
+  if (distance < 0) return { riskBand: "already-below" as const, primaryFactor: "distance" as const };
+  if (distance <= .01 && volatilityPercentile >= .9) return { riskBand: "high" as const, primaryFactor: "distance" as const };
+  if (distance <= .03 && volatilityPercentile >= .75) return { riskBand: "elevated" as const, primaryFactor: "distance" as const };
+  if (distance <= .03) return { riskBand: "elevated" as const, primaryFactor: "distance" as const };
+  if (volatilityPercentile >= .75) return { riskBand: "elevated" as const, primaryFactor: "volatility-percentile" as const };
+  return { riskBand: "low" as const, primaryFactor: "distance" as const };
+}
+
 const VOLATILITY_WINDOW = 756;
 const MIN_REFERENCE = 252;
 const MA_WINDOW = 250;
@@ -139,7 +149,7 @@ export function volatilityEntryCap(point: Pick<VolatilityPoint, "ready" | "perce
 
 /** A cap is an entry permission, not a liquidation signal. */
 export function applyNewTacticalVolatilityCap(currentPosition: number, candidate: number, cap: number) {
-  return candidate > currentPosition && candidate > .5 ? Math.min(candidate, cap) : candidate;
+  return candidate > currentPosition && candidate > .5 ? Math.max(currentPosition, Math.min(candidate, cap)) : candidate;
 }
 
 function distanceSeries(closes: number[]) {
@@ -201,7 +211,8 @@ function buildIntervals(points: PriceVolatilityRegimePoint[]) {
           const segment = open.segments.at(-1)!;
           segment.end = point.date; segment.qualifyingDays += 1; open.qualifyingDays += 1;
         }
-        open.end = point.date; open.endDate = point.date; gap = qualifying ? 0 : gap + 1;
+        if (qualifying) { open.end = point.date; open.endDate = point.date; gap = 0; }
+        else gap += 1;
       } else if (open) {
         open.closedAt = point.date;
         open.incomplete = point.incomplete;
@@ -222,7 +233,7 @@ export function computePriceVolatilityRegimes(bars: RegimeBar[], factorPoints: D
     const reference = distances.slice(Math.max(0, index - VOLATILITY_WINDOW), index).filter((item): item is number => item !== null);
     const pricePercentile = distance !== null && reference.length >= MIN_REFERENCE ? percentileMidrank(reference, distance) : null;
     const states = new Set<RegimeName>();
-    if (distance !== null && pricePercentile !== null && pricePercentile <= .1) states.add("price-deep-low");
+    if (distance !== null && pricePercentile !== null && distance < 0 && pricePercentile <= .1) states.add("price-deep-low");
     else if (distance !== null && pricePercentile !== null && pricePercentile <= .2 && distance < 0) states.add("price-low");
     if (volatility[index].ready && volatility[index].percentile! >= .9) states.add("volatility-stress");
     const known = new Set<RegimeName>();
@@ -255,7 +266,7 @@ export function computeDurableMaBreakLabels(bars: RegimeBar[]): DurableBreakLabe
   const distances = distanceSeries(bars.map((bar) => bar.close));
   return ([10, 20] as const).flatMap((horizon) => distances.map((distance, index) => {
     const eligible = distance !== null && distance >= 0;
-    const observable = index + 22 < distances.length;
+    const observable = index + horizon + 3 < distances.length;
     if (!eligible || !observable) return { index, date: bars[index].date ?? String(index), horizon, breakIndex: null, label: false, eligible, observable };
     let breakIndex: number | null = null;
     for (let candidate = index + 1; candidate <= Math.min(index + horizon, distances.length - 4); candidate += 1) {
@@ -273,11 +284,7 @@ export function computePriceVolatilityShadowRisk(bars: RegimeBar[]): ShadowRiskR
   const point = regimes.points.at(-1);
   const volatilityPercentile = point?.volatility.percentile ?? null;
   const distance = point?.distance ?? null;
-  const riskBand = distance === null ? "unavailable"
-    : distance < 0 ? "already-below"
-      : volatilityPercentile !== null && volatilityPercentile >= .9 ? "high" : "low";
-  const primaryFactor = distance === null ? null
-    : volatilityPercentile !== null && volatilityPercentile >= .9 ? "volatility-percentile" : "distance";
+  const { riskBand, primaryFactor } = assessPriceVolatilityRisk(distance, volatilityPercentile);
   return {
     status: "insufficient-evidence",
     probability: null,

@@ -52,6 +52,7 @@ test("server-renders the A-share research application", async () => {
   assert.match(html, /这是 ETF 价格，不是官方基金净值；不以 007467 净值替代/);
   assert.match(html, /双因子（价格＋波动率）影子观察/);
   assert.match(html, /研究观察，不改变实盘仓位，不发送飞书/);
+  assert.match(html, /利差新增许可上限/);
 });
 
 test("keeps data provenance and current metadata explicit", async () => {
@@ -80,4 +81,5 @@ test("keeps data provenance and current metadata explicit", async () => {
   assert.match(tracker, /idempotencyKey/);
   assert.match(tracker, /\/api\/factors\/dividend-ladder\/history/);
   assert.match(tracker, /computePriceVolatilityRegimes/);
+  assert.match(tracker, /仅阻止新增，已有仓位保持；不会为回到上限而卖出/);
 });

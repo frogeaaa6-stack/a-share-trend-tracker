@@ -180,6 +180,25 @@ test("tactical tranches and their guards activate only after the 50% core is com
   assert.ok(decision.matchedRules.some((rule) => rule.includes("第一机动档")));
 });
 
+test("entry-only factor caps never turn an existing tactical holding into a sell", () => {
+  const data = bars(300, 100);
+  for (let index = data.length - 16; index < data.length; index += 1) {
+    Object.assign(data[index], { open: 90, high: 90.4, low: 89.6, close: 90 });
+  }
+  const decision = evaluateEnhancedDividendLadder(
+    data,
+    .75,
+    undefined,
+    { dividendYield: .03, governmentBond10Y: .02, verified: true },
+  );
+  assert.equal(decision.phase, "core-tactical");
+  assert.ok(decision.durationBuyFloor >= 1);
+  assert.ok(decision.target >= .75);
+  assert.notEqual(decision.action, "sell");
+  assert.ok(decision.pendingRules.some((rule) => rule.includes("已有 75% 保持")));
+  assert.ok(!decision.pendingRules.some((rule) => rule.includes("当前最多 50%")));
+});
+
 test("execution rejects unavailable or one-price opens", () => {
   assert.equal(isExecutableOpen({ date: "2026-01-01", close: 1, volume: 1 }), false);
   assert.equal(isExecutableOpen({ date: "2026-01-01", close: 1, open: 1, volume: 0 }), false);

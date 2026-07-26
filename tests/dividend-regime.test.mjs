@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applyNewTacticalVolatilityCap,
+  assessPriceVolatilityRisk,
   computeDurableMaBreakLabels,
   computePriceVolatilityRegimes,
   computeVolatilitySeries,
@@ -38,6 +39,7 @@ test("volatility entry cap honors the 75th and 90th percentile boundaries", () =
 
 test("volatility guard caps only a new tactical tranche and never reduces existing exposure", () => {
   assert.equal(applyNewTacticalVolatilityCap(.5, .75, .5), .5);
+  assert.equal(applyNewTacticalVolatilityCap(.75, 1, .5), .75);
   assert.equal(applyNewTacticalVolatilityCap(1, 1, .5), 1);
   assert.equal(applyNewTacticalVolatilityCap(.5, .5, .5), .5);
   assert.equal(applyNewTacticalVolatilityCap(.2, .5, .5), .5, "cold-start/core 50% is unaffected");
@@ -50,11 +52,31 @@ test("joint regimes fail closed when same-day spread history is insufficient", (
   assert.equal(regimes.jointStatesEnabled, false);
 });
 
+test("price-deep-low needs a negative distance and a regime ends at its last raw qualifying day", () => {
+  const data = bars(600, 100).map((bar, index) => ({ ...bar, close: index < 550 ? 100 : index < 556 ? 90 : 100 }));
+  const regimes = computePriceVolatilityRegimes(data);
+  const deep = regimes.intervals.find((interval) => interval.state === "price-deep-low");
+  assert.ok(deep);
+  assert.equal(deep.endDate, "D555");
+  assert.equal(deep.end, "D555");
+  assert.equal(deep.closedAt, "D558");
+  assert.ok(regimes.points.filter((point) => point.distance !== null && point.distance >= 0).every((point) => !point.states.includes("price-deep-low")));
+});
+
+test("shadow risk is a transparent two-factor observation without a probability", () => {
+  assert.deepEqual(assessPriceVolatilityRisk(null, .9), { riskBand: "unavailable", primaryFactor: null });
+  assert.deepEqual(assessPriceVolatilityRisk(-.001, .99), { riskBand: "already-below", primaryFactor: "distance" });
+  assert.deepEqual(assessPriceVolatilityRisk(.01, .9), { riskBand: "high", primaryFactor: "distance" });
+  assert.deepEqual(assessPriceVolatilityRisk(.0301, .75), { riskBand: "elevated", primaryFactor: "volatility-percentile" });
+  assert.deepEqual(assessPriceVolatilityRisk(.0301, .7499), { riskBand: "low", primaryFactor: "distance" });
+});
+
 test("durable annual-line break labels require confirmation and drop the unobservable tail", () => {
   const data = bars(360, 100).map((bar, index) => ({ ...bar, close: index < 280 ? 100 : 90 }));
   const labels = computeDurableMaBreakLabels(data);
   assert.ok(labels.some((label) => label.label && label.horizon === 20));
-  assert.ok(labels.filter((label) => label.index >= data.length - 22).every((label) => !label.observable && !label.label && label.breakIndex === null));
+  assert.ok(labels.every((label) => label.observable === (label.index + label.horizon + 3 < data.length)));
+  assert.ok(labels.filter((label) => !label.observable).every((label) => !label.label && label.breakIndex === null));
   assert.ok(labels.filter((label) => label.label === false).some((label) => !label.eligible || !label.observable), "training callers must exclude non-eligible/non-observable negatives");
   const shadow = computePriceVolatilityShadowRisk(data);
   assert.equal(shadow.status, "insufficient-evidence");
