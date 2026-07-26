@@ -1,0 +1,1 @@
+ALTER TABLE `dividend_strategy_trades` ADD `amount` real;

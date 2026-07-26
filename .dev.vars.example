@@ -1,0 +1,9 @@
+# Copy this file to .dev.vars, then replace the placeholders locally.
+# Never paste the real App Secret into source code or chat.
+FEISHU_ALERT_ENABLED="true"
+FEISHU_ALERT_MODE="app"
+FEISHU_APP_ID="cli_REPLACE_WITH_YOUR_APP_ID"
+FEISHU_APP_SECRET="REPLACE_WITH_YOUR_APP_SECRET"
+FEISHU_RECEIVE_ID_TYPE="chat_id"
+FEISHU_RECEIVE_ID="oc_REPLACE_WITH_THE_TARGET_CHAT_ID"
+FEISHU_ALERT_KEYWORD="A股策略提醒"
