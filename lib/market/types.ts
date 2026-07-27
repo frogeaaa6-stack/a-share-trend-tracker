@@ -25,6 +25,13 @@ export type SourceStatus = {
   status: "ok" | "error";
   barCount: number;
   message?: string;
+  attempts?: number;
+  code?: string;
+  kind?: string;
+  httpStatus?: number;
+  retryable?: boolean;
+  requestUrl?: string;
+  cause?: string;
 };
 
 export type Quality = {
@@ -50,6 +57,7 @@ export type ProviderResponse = {
   requestUrl: string;
   raw: unknown;
   bars: MarketBar[];
+  attempts: number;
 };
 
 export type NormalizedSymbol = {

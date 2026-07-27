@@ -57,6 +57,15 @@ export type FeishuStrategyAlert = {
 
 export type FeishuBuyAlert = FeishuStrategyAlert;
 
+export type FeishuMarketDataFailureAlert = {
+  symbol: string;
+  shanghaiDate: string;
+  runId: string;
+  failedSources: Array<{ provider: string; message: string; attempts?: number; code?: string; cause?: string }>;
+  successfulSources: string[];
+  lastVerified?: { version: number; asOf: string };
+};
+
 export class FeishuDeliveryUncertainError extends Error {
   constructor(message: string) {
     super(message);
@@ -439,8 +448,43 @@ export function buildFeishuStrategyAlertContent(input: FeishuStrategyAlert) {
   return { title, markdown, note, template: isTest ? "blue" : level.template };
 }
 
+export function buildFeishuMarketDataFailureAlertContent(input: FeishuMarketDataFailureAlert) {
+  const failures = input.failedSources.map((source) => {
+    const attempts = source.attempts ? `；已尝试 ${source.attempts} 次` : "";
+    const code = source.code ? `；${source.code}` : "";
+    const cause = source.cause ? `；根因：${source.cause}` : "";
+    return `• ${source.provider}：${source.message}${code}${attempts}${cause}`;
+  }).join("\n") || "• 未提供失败源明细";
+  const lastVersion = input.lastVerified ? `v${input.lastVerified.version}（asOf ${input.lastVerified.asOf}）` : "无可用合格版本";
+  return {
+    title: "【数据链路异常】红利低波ETF｜午间策略结果暂停",
+    markdown: [
+      "**标的**",
+      "华泰柏瑞中证红利低波动交易型开放式指数证券投资基金",
+      `代码：${input.symbol}　上海日期：${input.shanghaiDate}`,
+      "",
+      "**本次刷新失败**",
+      `运行编号：${input.runId}`,
+      failures,
+      `成功源：${input.successfulSources.length ? input.successfulSources.join(" + ") : "无"}`,
+      `上次双源合格版本：${lastVersion}`,
+      "",
+      "**安全结论**",
+      "本次未生成任何买入或卖出建议，请勿依据旧数据交易。",
+      "双源验证未完成，午间策略计算已暂停；请待后续完整日线刷新成功后再人工核对。",
+    ].join("\n"),
+    note: "数据链路故障提醒｜不连接券商、不自动下单，不构成投资建议。",
+    template: "red",
+  };
+}
+
 export async function sendFeishuTestAlert(input: FeishuStrategyAlert) {
   const content = buildFeishuStrategyAlertContent({ ...input, kind: "test" });
+  await sendCard(content.title, content.markdown, content.note, content.template);
+}
+
+export async function sendFeishuMarketDataFailureAlert(input: FeishuMarketDataFailureAlert) {
+  const content = buildFeishuMarketDataFailureAlertContent(input);
   await sendCard(content.title, content.markdown, content.note, content.template);
 }
 

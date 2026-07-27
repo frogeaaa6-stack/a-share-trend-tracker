@@ -1,9 +1,11 @@
 import { crossValidate } from "@/lib/market/validation";
-import { fetchEastmoney, fetchTencent } from "@/lib/market/providers";
+import { fetchEastmoney, fetchTencent, ProviderError } from "@/lib/market/providers";
 import { normalizeDays, normalizeSymbol } from "@/lib/market/symbols";
 import { createRun, ensureMarketSchema, finishRun, getLatestDataset, isFresh, publishDataset, saveIssues, saveSnapshot } from "@/lib/market/persistence";
 import { canServeCompleteOnly, shanghaiCalendarDate } from "@/lib/market/completedDailyBars";
 import type { MarketIssue, SourceStatus } from "@/lib/market/types";
+import { deliverFeishuMarketDataFailureAlert } from "@/lib/notifications/marketDataFailure";
+import { shouldAlertOnSourceFailure } from "@/lib/market/syncPolicy";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +25,30 @@ function trustedLocalJsonRequest(request: Request) {
   }
 }
 
-function unavailable(error: string) {
-  return Response.json({ code: "MARKET_DATA_UNAVAILABLE", error, adjustment: "qfq", limitations: ["Both non-official web data sources failed and no verified local version exists."] }, { status: 502 });
+function unavailable(error: string, refresh?: Record<string, unknown>) {
+  return Response.json({ code: "MARKET_DATA_UNAVAILABLE", error, adjustment: "qfq", refresh, limitations: ["Both non-official web data sources failed and no verified local version exists."] }, { status: 502 });
+}
+
+function sourceError(error: unknown, provider: SourceStatus["provider"]): SourceStatus {
+  const fallback = error instanceof Error ? error.message : "unknown upstream failure";
+  if (!(error instanceof ProviderError)) return { provider, status: "error", barCount: 0, message: fallback, attempts: 1, code: "UNKNOWN_UPSTREAM_ERROR", kind: "network", retryable: false };
+  return {
+    provider,
+    status: "error",
+    barCount: 0,
+    message: error.message,
+    attempts: error.attempts,
+    code: error.code,
+    kind: error.kind,
+    httpStatus: error.status,
+    retryable: error.retryable,
+    requestUrl: error.requestUrl,
+    cause: error.causeSummary,
+  };
+}
+
+function sourceSnapshotError(source: SourceStatus) {
+  return JSON.stringify({ message: source.message, attempts: source.attempts, code: source.code, kind: source.kind, httpStatus: source.httpStatus, retryable: source.retryable, cause: source.cause });
 }
 
 const LIMITATIONS = [
@@ -39,12 +63,18 @@ export async function POST(request: Request) {
   let symbol: string;
   let days: number;
   let completeOnly: boolean;
+  let purpose: "scheduled" | undefined;
+  let notifyOnSourceFailure = false;
   try {
-    const payload = await request.json() as { symbol?: unknown; days?: unknown; completeOnly?: unknown };
+    const payload = await request.json() as { symbol?: unknown; days?: unknown; completeOnly?: unknown; purpose?: unknown; notifyOnSourceFailure?: unknown };
     symbol = normalizeSymbol(payload.symbol).symbol;
     days = normalizeDays(payload.days);
     if (payload.completeOnly !== undefined && typeof payload.completeOnly !== "boolean") throw new Error("completeOnly must be a boolean");
+    if (payload.purpose !== undefined && payload.purpose !== "scheduled") throw new Error("purpose only supports scheduled");
+    if (payload.notifyOnSourceFailure !== undefined && typeof payload.notifyOnSourceFailure !== "boolean") throw new Error("notifyOnSourceFailure must be a boolean");
     completeOnly = payload.completeOnly === true;
+    purpose = payload.purpose === "scheduled" ? "scheduled" : undefined;
+    notifyOnSourceFailure = payload.notifyOnSourceFailure === true;
   } catch (error) {
     return Response.json({ code: "INVALID_REQUEST", error: message(error) }, { status: 400 });
   }
@@ -81,12 +111,12 @@ export async function POST(request: Request) {
       const provider = sourceNames[index];
       if (result.status === "fulfilled") {
         const completed = provider === "eastmoney" ? completedEastmoney : completedTencent;
-        sources.push({ provider, status: "ok", barCount: completed?.bars.length ?? 0 });
+        sources.push({ provider, status: "ok", barCount: completed?.bars.length ?? 0, attempts: result.value.attempts, requestUrl: result.value.requestUrl });
         await saveSnapshot(runId, { provider, requestUrl: result.value.requestUrl, raw: result.value.raw });
       } else {
-        const error = message(result.reason);
-        sources.push({ provider, status: "error", barCount: 0, message: error });
-        await saveSnapshot(runId, { provider, requestUrl: "not-recorded: request failed before response", error });
+        const source = sourceError(result.reason, provider);
+        sources.push(source);
+        await saveSnapshot(runId, { provider, requestUrl: source.requestUrl ?? "not-recorded: request failed before response", raw: { failure: source }, error: sourceSnapshotError(source) });
       }
     }
 
@@ -103,7 +133,24 @@ export async function POST(request: Request) {
       await saveIssues(runId, issues);
     }
     await finishRun(runId, "failed");
+    const rejectedSources = sources.filter((source) => source.status === "error");
     const fallback = await getLatestDataset(symbol, days);
+    let alertDelivery: unknown;
+    if (shouldAlertOnSourceFailure({ completeOnly, purpose, notifyOnSourceFailure, rejectedSourceCount: rejectedSources.length })) {
+      try {
+        alertDelivery = await deliverFeishuMarketDataFailureAlert({
+          symbol,
+          shanghaiDate: excludedDate ?? shanghaiCalendarDate(),
+          runId,
+          failedSources: rejectedSources.map((source) => ({ provider: source.provider, message: source.message ?? "upstream failure", attempts: source.attempts, code: source.code, cause: source.cause })),
+          successfulSources: sources.filter((source) => source.status === "ok").map((source) => source.provider),
+          lastVerified: fallback ? { version: fallback.dataset.version, asOf: fallback.bars.at(-1)?.date ?? fallback.dataset.createdAt } : undefined,
+        });
+      } catch (error) {
+        alertDelivery = { sent: false, status: "failed", error: message(error) };
+      }
+    }
+    const refresh = rejectedSources.length ? { status: "failed", reason: "source_unavailable", runId, sources, alertDelivery } : undefined;
     if (fallback && canServeCompleteOnly(fallback.bars.at(-1)?.date, excludedDate)) {
       return Response.json({
         ...fallback,
@@ -112,11 +159,12 @@ export async function POST(request: Request) {
         asOf: fallback.bars.at(-1)?.date ?? fallback.dataset.createdAt,
         completeOnly,
         excludedDate,
+        refresh,
         limitations: ["Serving the last verified local dataset because a new dual-source validation did not pass.", ...LIMITATIONS],
       });
     }
-    if (fallback && completeOnly) return unavailable("The last verified cache contains the current Shanghai session, so no complete T-1 fallback can be served.");
-    return unavailable("No new dual-source-verified dataset could be published.");
+    if (fallback && completeOnly) return unavailable("The last verified cache contains the current Shanghai session, so no complete T-1 fallback can be served.", refresh);
+    return unavailable("No new dual-source-verified dataset could be published.", refresh);
   } catch (error) {
     try {
       const fallback = await getLatestDataset(symbol, days);
