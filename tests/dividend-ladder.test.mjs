@@ -88,6 +88,18 @@ test("cold-start time fallbacks build the core in 20/35/50% stages", () => {
   assert.equal(third.nextDeadlineTradingDay, 168);
 });
 
+test("a noon-sized provisional volume alone does not downgrade a verified cold-start buy", () => {
+  const data = bars(300, 100);
+  // The appended T-day 11:30 snapshot is intentionally far below daily
+  // turnover. Cold-start entry has no full-day volume gate to fail closed on.
+  data[data.length - 1].volume = 100;
+  const decision = evaluateEnhancedDividendLadder(data, 0, { verified: true, stale: false }, null, true, { coldStartTradingDays: 21 });
+  assert.equal(decision.volumeRatio < .001, true);
+  assert.equal(decision.action, "buy");
+  assert.equal(decision.target, .2);
+  assert.ok(!decision.gates.some((gate) => /成交量|volume/i.test(gate)));
+});
+
 test("cold-start elapsed trading days can be derived from a persisted start date", () => {
   const data = bars(300, 100);
   const decision = evaluateEnhancedDividendLadder(

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { env } from "cloudflare:workers";
-import { publishDataset, saveIssues } from "../lib/market/persistence.ts";
+import { getLatestVerifiedNoonSnapshot, publishDataset, publishNoonSnapshot, saveIssues } from "../lib/market/persistence.ts";
 
 class FakeStatement {
   constructor(sql) {
@@ -90,4 +90,40 @@ test("publishes more than 1,000 bars with two set-based D1 statements", async ()
   const issueInsert = prepared.at(-1);
   assert.match(issueInsert.sql, /FROM json_each\(\?\)/);
   assert.equal(JSON.parse(issueInsert.args[1]).length, issues.length);
+});
+
+test("persists a verified noon snapshot independently and never inserts it into market_bars", async () => {
+  const prepared = [];
+  const row = {
+    id: "noon-1", symbol: "512890.SH", date: "2026-07-27", snapshot_time: "11:30", run_id: "run-noon", hash: "hash", created_at: "2026-07-27T03:30:00.000Z",
+    open: 1.161, high: 1.168, low: 1.158, close: 1.163, volume: 3_855_425, amount: 448_280_357,
+    quality_json: JSON.stringify({ quality: { score: 90, grade: "B", coverage: 100, overlapDays: 1, matchedDays: 1, conflictDays: 0, agreementPct: 100, maxPriceDiffBps: 17 }, issues: [{ code: "NOON_OHLC_WARNING", severity: "warning", message: "fixture" }] }),
+  };
+  env.DB = {
+    prepare(sql) {
+      const statement = new FakeStatement(sql);
+      statement.first = async () => row;
+      prepared.push(statement);
+      return statement;
+    },
+  };
+
+  const validation = {
+    verified: true,
+    snapshot: { date: "2026-07-27", snapshotTime: "11:30", provider: "eastmoney", rowCount: 121, open: 1.161, high: 1.168, low: 1.158, close: 1.163, volume: 3_855_425, amount: 448_280_357 },
+    quality: { score: 90, grade: "B", coverage: 100, overlapDays: 1, matchedDays: 1, conflictDays: 0, agreementPct: 100, maxPriceDiffBps: 17 },
+    issues: [{ code: "NOON_OHLC_WARNING", severity: "warning", message: "fixture" }],
+    sources: [],
+  };
+  const published = await publishNoonSnapshot("run-noon", "512890.SH", validation);
+  const loaded = await getLatestVerifiedNoonSnapshot("512890.SH", "2026-07-27");
+  const sql = prepared.map((statement) => statement.sql).join("\n");
+
+  assert.match(sql, /INSERT INTO market_noon_snapshots/);
+  assert.match(sql, /FROM market_noon_snapshots/);
+  assert.doesNotMatch(sql, /market_bars/);
+  assert.equal(published.snapshot.close, 1.163);
+  assert.equal(loaded?.snapshot.close, 1.163);
+  assert.equal(loaded?.snapshot.provider, "eastmoney");
+  assert.equal(loaded?.validation.quality.grade, "B");
 });

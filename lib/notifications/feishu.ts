@@ -53,6 +53,13 @@ export type FeishuStrategyAlert = {
   accountEquity: number;
   marketValue: number;
   averageCost: number | null;
+  noonSnapshotTime?: "11:30";
+  noonBaseAsOf?: string;
+  noonSnapshotHash?: string;
+  noonQualityGrade?: string;
+  noonQualityScore?: number;
+  noonSources?: string[];
+  noonVolumeProvisional?: boolean;
 };
 
 export type FeishuBuyAlert = FeishuStrategyAlert;
@@ -383,13 +390,18 @@ export function buildFeishuStrategyAlertContent(input: FeishuStrategyAlert) {
   const nextDeadline = input.nextDeadlineTradingDay === null
     ? "不适用"
     : `第 ${input.nextDeadlineTradingDay} 个交易日${input.nextTarget === null ? "" : `前完成至 ${position(input.nextTarget)}`}`;
+  const matchedRules = isScheduled
+    ? input.matchedRules.map((rule) => rule.startsWith("成交护栏通过")
+        ? "成交护栏午盘观察：近两根完整日线与今日截至 11:30 暂未出现放量长阴；全天结果待收盘验证"
+        : rule)
+    : input.matchedRules;
   const markdown = [
     "**标的**",
     "华泰柏瑞中证红利低波动交易型开放式指数证券投资基金",
     `简称：红利低波ETF　代码：${input.symbol}`,
     "",
     "**策略结论**",
-    `信号日期：${input.signalDate}　消息：${isTest ? "测试（照常展示真实复算结论）" : isLive ? "正式上线状态播报" : isScheduled ? "交易日午间状态播报（完整 T-1 日线）" : "正式批次提醒"}`,
+    `信号日期：${input.signalDate}　消息：${isTest ? "测试（照常展示真实复算结论）" : isLive ? "正式上线状态播报" : isScheduled ? `交易日午间状态播报（T 日 11:30，历史基线截至 ${input.noonBaseAsOf ?? "T-1"}）` : "正式批次提醒"}`,
     `策略版本：${input.strategyVersion}　阶段：${phaseLabel(input.phase)}`,
     `提醒级别：${level.label}`,
     `动作：${actionLabel(input.action)}　结论：${input.decisionLabel}`,
@@ -400,13 +412,13 @@ export function buildFeishuStrategyAlertContent(input: FeishuStrategyAlert) {
     `冷启动计时：${coldStart}　下一最晚节点：${nextDeadline}`,
     "",
     "**价格与时序**",
-    `收盘 / MA250：¥${input.close.toFixed(3)} / ¥${input.ma250.toFixed(3)}`,
+    isScheduled ? `11:30 午盘价 / 临时 MA250：¥${input.close.toFixed(3)} / ¥${input.ma250.toFixed(3)}` : `收盘 / MA250：¥${input.close.toFixed(3)} / ¥${input.ma250.toFixed(3)}`,
     `距年线：${naturalPercent(input.distance, 2)}　MA250 近 20 日斜率：${naturalPercent(input.slope20, 2)}`,
     `连续低于年线：${input.belowMaDays} 个交易日${input.belowMaSince ? `（自 ${input.belowMaSince}）` : ""}`,
     `较近 20 日低点反弹：${naturalPercent(input.rebound20Pct, 2)}`,
     "",
     "**已命中策略**",
-    listLines(input.matchedRules, "暂无达到的买卖阈值；基础数据已完成复算"),
+    listLines(matchedRules, "暂无达到的买卖阈值；基础数据已完成复算"),
     "",
     "**未命中 / 阻挡条件**",
     listLines(input.pendingRules, "无额外阻挡条件"),
@@ -427,7 +439,12 @@ export function buildFeishuStrategyAlertContent(input: FeishuStrategyAlert) {
     "",
     "**数据验证**",
     `行情：${marketStatus}`,
-    `口径：前复权日线；服务器读取本地已发布版本并重新计算，浏览器不能指定信号、价格或目标仓位。`,
+    isScheduled
+      ? `口径：T 日 11:30 双源午盘快照 + 截至 ${input.noonBaseAsOf ?? "T-1"} 的前复权完整日线；午盘快照不写入日线数据集或现有完整日线回测。`
+      : `口径：前复权日线；服务器读取本地已发布版本并重新计算，浏览器不能指定信号、价格或目标仓位。`,
+    ...(isScheduled ? [`午盘：${input.noonSources?.join(" + ") ?? "双源"} 双源验证通过（质量 ${input.noonQualityGrade ?? "—"}/${input.noonQualityScore ?? "—"}；快照 ${input.noonSnapshotHash?.slice(0, 12) ?? "—"}；截至 11:30）。`, `日线基线：v${input.marketDatasetVersion}，截至 ${input.noonBaseAsOf ?? "T-1"}；上方“行情”质量仅对应完整日线基线。`] : []),
+    ...(isScheduled && input.noonVolumeProvisional ? ["午盘成交量/成交额为截至 11:30 的临时累计值；任何成交量护栏须在 13:00 后由人工复核，不能视为全天已通过。"] : []),
+    ...(isScheduled ? ["午盘指标：MA250、近 20 日斜率、连续跌破日数、20 日反弹和波动率分位均按 11:30 临时 bar 重算，可用于当日判断，但不属于完整日线回测口径。"] : []),
     "",
     "**执行口径**",
     isTest
@@ -435,7 +452,7 @@ export function buildFeishuStrategyAlertContent(input: FeishuStrategyAlert) {
       : isLive
         ? "本条为策略提醒正式上线状态播报；如当前未触发买入，将如实显示等待，不会伪造交易信号。后续正式买入提醒仍须服务器复算为新的买入批次。"
         : isScheduled
-          ? "本条由交易日 12:00 本地任务发送；只使用剔除当天午盘后的完整 T-1 日线。买入或卖出仍须人工确认，不连接券商。"
+          ? "本条由交易日 12:00 本地任务发送；T 日午盘确认，13:00 后人工判断/执行。不是 15:00 收盘信号，不连接券商。"
       : "按最新完整交易日日线确认信号，单次建议最多增加 25% 仓位；当前正式规则为 T 日收盘确认、计划 T+1 开盘人工执行。",
   ].join("\n");
   const note = isTest
@@ -443,7 +460,7 @@ export function buildFeishuStrategyAlertContent(input: FeishuStrategyAlert) {
     : isLive
       ? "正式上线｜策略状态播报已启用；仅供研究与人工决策，不连接券商、不自动下单，不构成投资建议。"
       : isScheduled
-        ? "交易日 12:00｜完整 T-1 日线状态；仅供研究与人工决策，不连接券商、不自动下单，不构成投资建议。"
+        ? "交易日 12:00｜T 日 11:30 午盘快照，13:00 后人工判断/执行；不纳入完整日线回测，不连接券商、不自动下单，不构成投资建议。"
     : "规则提醒｜仅供研究与人工决策，不连接券商、不自动下单，不构成投资建议。";
   return { title, markdown, note, template: isTest ? "blue" : level.template };
 }

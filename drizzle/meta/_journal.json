@@ -29,6 +29,13 @@
       "when": 1784988664214,
       "tag": "0003_keen_jack_power",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1785137246112,
+      "tag": "0004_market_noon_snapshots",
+      "breakpoints": true
     }
   ]
 }

@@ -10,7 +10,8 @@ import {
 } from "@/lib/notifications/feishu";
 import { getDividendLadderFactors } from "@/lib/factors/dividendLadderFactors";
 import { completedDailyBarError } from "@/lib/market/completedDailyBars";
-import { ensureMarketSchema, getLatestDataset, isFresh } from "@/lib/market/persistence";
+import { ensureMarketSchema, getLatestDataset, getLatestVerifiedNoonSnapshot, isFresh } from "@/lib/market/persistence";
+import { shanghaiCalendarDate } from "@/lib/market/completedDailyBars";
 import {
   claimFeishuAlert,
   markFeishuAlertFailed,
@@ -28,7 +29,7 @@ import { getDividendAccountSnapshot } from "@/lib/strategy/dividendAccountPersis
 
 export const dynamic = "force-dynamic";
 const SYMBOL = "512890.SH";
-const STRATEGY_VERSION = "hybrid-core-tactical-v4";
+const STRATEGY_VERSION = "volatility-guarded-v5";
 
 function localHost(request: Request) {
   return new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(new URL(request.url).hostname);
@@ -109,17 +110,20 @@ async function recomputeStrategyAlert(
   if (!market || market.bars.length < 270) throw new Error("没有足够的本地双源验证日线");
   if (!isFresh(market)) throw new Error("本地行情版本已过期，请先刷新红利低波数据");
   assertCompletedDailyBar(market.bars.at(-1)!.date, kind === "scheduled");
+  const noon = kind === "scheduled" ? await getLatestVerifiedNoonSnapshot(SYMBOL, shanghaiCalendarDate()) : null;
+  if (kind === "scheduled" && !noon) throw new Error("今天 11:30 午盘快照尚未双源验证；正常策略卡已暂停");
+  const strategyBars: DividendLadderBar[] = noon ? [...market.bars, { ...noon.snapshot, date: noon.date }] : market.bars;
   const { trades: accountTrades, metadata: accountMetadata } = await getDividendAccountSnapshot();
-  const markedAccount = calculateDividendAccount(accountTrades, market.bars.at(-1)!.close);
+  const markedAccount = calculateDividendAccount(accountTrades, strategyBars.at(-1)!.close);
   const position = accountTrades.length
     ? markedAccount.strategyAllocation
     : requestedPosition;
   const ledgerStartDate = accountTrades.find((trade) => trade.side === "buy")?.tradeDate
     ?? accountMetadata.createdAt.slice(0, 10);
-  const coldStart = coldStartContext(coldStartDate || ledgerStartDate, market.bars, position);
+  const coldStart = coldStartContext(coldStartDate || ledgerStartDate, strategyBars, position);
   const factors = await getDividendLadderFactors();
   const decision = evaluateEnhancedDividendLadder(
-    market.bars,
+    strategyBars,
     position,
     { verified: market.validation.verified, stale: false },
     {
@@ -135,17 +139,18 @@ async function recomputeStrategyAlert(
   if (!decision.ready || decision.target === null || decision.close === null || decision.ma250 === null || decision.distance === null) {
     throw new Error("服务器策略复算尚未就绪");
   }
+  const provisionalVolume = Boolean(noon && decision.volumeRatio !== null);
   const executionTarget = decision.action === "buy"
     ? Math.min(decision.target, position + .25)
     : decision.action === "sell"
       ? Math.max(decision.target, position - .25)
       : decision.target;
-  const pendingRules = [...new Set([...(decision.pendingRules ?? []), ...decision.gates])];
+  const pendingRules = [...new Set([...(decision.pendingRules ?? []), ...decision.gates, ...(provisionalVolume ? ["午盘成交量为截至 11:30 的临时累计值；13:00 后人工执行时仍不能视为全天成交量护栏已通过"] : [])])];
   return {
     kind,
     symbol: SYMBOL,
     strategyVersion: STRATEGY_VERSION,
-    signalDate: market.bars.at(-1)!.date,
+    signalDate: noon?.date ?? market.bars.at(-1)!.date,
     currentPosition: position,
     executionTarget,
     strategyTarget: decision.target,
@@ -188,6 +193,13 @@ async function recomputeStrategyAlert(
     accountEquity: markedAccount.accountEquity ?? DIVIDEND_STRATEGY_CAPITAL,
     marketValue: markedAccount.marketValue ?? DIVIDEND_STRATEGY_CAPITAL * position,
     averageCost: markedAccount.averageCost,
+    noonSnapshotTime: noon?.snapshotTime,
+    noonBaseAsOf: noon ? market.bars.at(-1)!.date : undefined,
+    noonSnapshotHash: noon?.hash,
+    noonQualityGrade: noon?.validation.quality.grade,
+    noonQualityScore: noon?.validation.quality.score,
+    noonSources: noon ? ["eastmoney", "tencent"] : undefined,
+    noonVolumeProvisional: provisionalVolume,
   };
 }
 
@@ -282,7 +294,7 @@ export async function POST(request: Request) {
       );
       const delivery = await deliverClaimedAlert(
         alert,
-        ["feishu-status-v1", "scheduled", alert.symbol, alert.signalDate, alert.action, alert.executionTarget.toFixed(2), alert.accountLedgerVersion].join("|"),
+        ["feishu-status-v1", "scheduled", alert.symbol, alert.signalDate, alert.noonSnapshotHash ?? "missing-noon-hash", alert.action, alert.executionTarget.toFixed(2), alert.accountLedgerVersion].join("|"),
         () => sendFeishuScheduledAlert(alert),
       );
       return Response.json({
@@ -291,6 +303,11 @@ export async function POST(request: Request) {
         decision: alert.decisionLabel,
         signalDate: alert.signalDate,
         mode: "scheduled",
+        marketMode: "verified_noon",
+        strategyVersion: alert.strategyVersion,
+        baseAsOf: alert.noonBaseAsOf,
+        snapshotTime: alert.noonSnapshotTime,
+        snapshotHash: alert.noonSnapshotHash,
       });
     }
     if (body.kind !== "buy" && body.kind !== "sell") throw new Error("只支持 test、live、scheduled、buy 或 sell 提醒");

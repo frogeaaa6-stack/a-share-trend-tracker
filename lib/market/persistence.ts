@@ -1,9 +1,11 @@
 import { env } from "cloudflare:workers";
 import { ADJUSTMENT, type MarketBar, type MarketIssue, type Quality, type SourceStatus, type ValidationResult } from "./types";
+import type { NoonSnapshot, NoonValidation } from "./noonSnapshot";
 
 type D1Result<T> = { results?: T[] };
 type DatasetRow = { id: string; symbol: string; adjustment: string; version: number; run_id: string; hash: string; created_at: string; quality_json: string };
 type BarRow = { date: string; open: number; high: number; low: number; close: number; volume: number; amount: number | null };
+type NoonRow = BarRow & { id: string; symbol: string; snapshot_time: "11:30"; run_id: string; hash: string; created_at: string; quality_json: string };
 
 const SCHEMA_SQL = [
   "CREATE TABLE IF NOT EXISTS market_runs (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, adjustment TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL)",
@@ -14,6 +16,9 @@ const SCHEMA_SQL = [
   "CREATE UNIQUE INDEX IF NOT EXISTS market_dataset_versions ON market_datasets(symbol, adjustment, version)",
   "CREATE INDEX IF NOT EXISTS market_datasets_latest ON market_datasets(symbol, adjustment, created_at DESC)",
   "CREATE INDEX IF NOT EXISTS market_bars_run_date ON market_bars(run_id, date)",
+  "CREATE TABLE IF NOT EXISTS market_noon_snapshots (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, date TEXT NOT NULL, snapshot_time TEXT NOT NULL, run_id TEXT NOT NULL, hash TEXT NOT NULL, created_at TEXT NOT NULL, verified INTEGER NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL, amount REAL, quality_json TEXT NOT NULL)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS market_noon_snapshots_unique ON market_noon_snapshots(symbol, date, snapshot_time, hash)",
+  "CREATE INDEX IF NOT EXISTS market_noon_snapshots_latest ON market_noon_snapshots(symbol, date, snapshot_time, verified, created_at DESC)",
 ];
 
 let schemaReady = false;
@@ -127,4 +132,26 @@ export async function getLatestDataset(symbol: string, limit = 2000): Promise<Pu
 
 export function isFresh(dataset: PublishedDataset) {
   return Date.now() - Date.parse(dataset.dataset.createdAt) < 15 * 60 * 1000;
+}
+
+export type PublishedNoonSnapshot = { id: string; symbol: string; date: string; snapshotTime: "11:30"; runId: string; hash: string; createdAt: string; snapshot: NoonSnapshot; validation: { verified: true; quality: Quality; issues: MarketIssue[] } };
+
+export async function publishNoonSnapshot(runId: string, symbol: string, validation: NoonValidation): Promise<PublishedNoonSnapshot> {
+  if (!validation.verified || !validation.snapshot) throw new Error("A noon snapshot must pass dual-source verification before publication.");
+  const snapshot = validation.snapshot;
+  const createdAt = now();
+  const hash = await digest(JSON.stringify({ symbol, date: snapshot.date, snapshotTime: snapshot.snapshotTime, snapshot, quality: validation.quality }));
+  const snapshotId = id();
+  await db().prepare("INSERT INTO market_noon_snapshots (id, symbol, date, snapshot_time, run_id, hash, created_at, verified, open, high, low, close, volume, amount, quality_json) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(snapshotId, symbol, snapshot.date, snapshot.snapshotTime, runId, hash, createdAt, snapshot.open, snapshot.high, snapshot.low, snapshot.close, snapshot.volume, snapshot.amount ?? null, JSON.stringify({ quality: validation.quality, issues: validation.issues })).run();
+  return { id: snapshotId, symbol, date: snapshot.date, snapshotTime: snapshot.snapshotTime, runId, hash, createdAt, snapshot, validation: { verified: true, quality: validation.quality, issues: validation.issues } };
+}
+
+export async function getLatestVerifiedNoonSnapshot(symbol: string, date: string): Promise<PublishedNoonSnapshot | null> {
+  const row = await db().prepare("SELECT id, symbol, date, snapshot_time, run_id, hash, created_at, open, high, low, close, volume, amount, quality_json FROM market_noon_snapshots WHERE symbol = ? AND date = ? AND snapshot_time = '11:30' AND verified = 1 ORDER BY created_at DESC LIMIT 1")
+    .bind(symbol, date).first<NoonRow>();
+  if (!row) return null;
+  const stored = JSON.parse(row.quality_json) as { quality: Quality; issues?: MarketIssue[] };
+  const snapshot: NoonSnapshot = { date: row.date, snapshotTime: row.snapshot_time, provider: "eastmoney", rowCount: 121, open: row.open, high: row.high, low: row.low, close: row.close, volume: row.volume, amount: row.amount ?? undefined };
+  return { id: row.id, symbol: row.symbol, date: row.date, snapshotTime: row.snapshot_time, runId: row.run_id, hash: row.hash, createdAt: row.created_at, snapshot, validation: { verified: true, quality: stored.quality, issues: stored.issues ?? [] } };
 }

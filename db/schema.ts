@@ -1,4 +1,4 @@
-import { integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 /** Immutable ingestion attempt. Source payloads and validation results point here. */
 export const marketRuns = sqliteTable("market_runs", {
@@ -59,6 +59,29 @@ export const marketDatasets = sqliteTable("market_datasets", {
   createdAt: text("created_at").notNull(),
   qualityJson: text("quality_json").notNull(),
 });
+
+/** A verified intraday 11:30 snapshot. It is deliberately not part of the daily-bar dataset. */
+export const marketNoonSnapshots = sqliteTable(
+  "market_noon_snapshots",
+  {
+    id: text("id").primaryKey(),
+    symbol: text("symbol").notNull(),
+    date: text("date").notNull(),
+    snapshotTime: text("snapshot_time").notNull(),
+    runId: text("run_id").notNull(),
+    hash: text("hash").notNull(),
+    createdAt: text("created_at").notNull(),
+    verified: integer("verified", { mode: "boolean" }).notNull(),
+    open: real("open").notNull(),
+    high: real("high").notNull(),
+    low: real("low").notNull(),
+    close: real("close").notNull(),
+    volume: real("volume").notNull(),
+    amount: real("amount"),
+    qualityJson: text("quality_json").notNull(),
+  },
+  (table) => [uniqueIndex("market_noon_snapshots_unique").on(table.symbol, table.date, table.snapshotTime, table.hash)],
+);
 
 /** Fixed-capital live account for the separately managed 512890 strategy. */
 export const dividendStrategyAccounts = sqliteTable("dividend_strategy_accounts", {

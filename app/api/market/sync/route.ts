@@ -2,6 +2,8 @@ import { crossValidate } from "@/lib/market/validation";
 import { fetchEastmoney, fetchTencent, ProviderError } from "@/lib/market/providers";
 import { normalizeDays, normalizeSymbol } from "@/lib/market/symbols";
 import { createRun, ensureMarketSchema, finishRun, getLatestDataset, isFresh, publishDataset, saveIssues, saveSnapshot } from "@/lib/market/persistence";
+import { getLatestVerifiedNoonSnapshot, publishNoonSnapshot } from "@/lib/market/persistence";
+import { fetchEastmoneyNoon, fetchTencentNoon, validateNoonSnapshots } from "@/lib/market/noonSnapshot";
 import { canServeCompleteOnly, shanghaiCalendarDate } from "@/lib/market/completedDailyBars";
 import type { MarketIssue, SourceStatus } from "@/lib/market/types";
 import { deliverFeishuMarketDataFailureAlert } from "@/lib/notifications/marketDataFailure";
@@ -56,6 +58,56 @@ const LIMITATIONS = [
   "Tencent may return its daily series when qfqday is unavailable; every published date is still cross-validated against Eastmoney.",
 ];
 
+async function syncScheduledNoon(symbol: string, days: number, notifyOnSourceFailure: boolean) {
+  const today = shanghaiCalendarDate();
+  const baseline = await getLatestDataset(symbol, days);
+  // A noon point is never allowed to repair or replace daily history: schedule only
+  // proceeds from a fresh, verified T-1 baseline.
+  if (!baseline || !isFresh(baseline) || !canServeCompleteOnly(baseline.bars.at(-1)?.date, today)) {
+    return unavailable("午盘快照前必须存在新鲜、已验证且截至 T-1 的完整日线基线。");
+  }
+  const existing = await getLatestVerifiedNoonSnapshot(symbol, today);
+  if (existing) return Response.json({ strategyReady: true, marketMode: "scheduled_noon", signalDate: today, snapshotTime: "11:30", baseAsOf: baseline.bars.at(-1)?.date, snapshot: existing, dataset: baseline.dataset, cached: true });
+  const runId = await createRun(symbol);
+  const results = await Promise.allSettled([fetchEastmoneyNoon(symbol, today), fetchTencentNoon(symbol, today)]);
+  const names = ["eastmoney", "tencent"] as const;
+  const sources: SourceStatus[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    const provider = names[index];
+    if (result.status === "fulfilled") {
+      sources.push({ provider, status: "ok", barCount: 1, attempts: result.value.attempts, requestUrl: result.value.requestUrl });
+      await saveSnapshot(runId, { provider, requestUrl: result.value.requestUrl, raw: result.value.raw });
+    } else {
+      const source = sourceError(result.reason, provider);
+      sources.push(source);
+      await saveSnapshot(runId, { provider, requestUrl: source.requestUrl ?? "not-recorded: request failed before response", raw: { failure: source }, error: sourceSnapshotError(source) });
+    }
+  }
+  const fulfilled = results.filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof fetchEastmoneyNoon>>> => result.status === "fulfilled");
+  let validation;
+  if (fulfilled.length === 2) {
+    validation = validateNoonSnapshots(fulfilled[0].value, fulfilled[1].value, today);
+    await saveIssues(runId, validation.issues);
+    if (validation.verified) {
+      const snapshot = await publishNoonSnapshot(runId, symbol, validation);
+      await finishRun(runId, "published");
+      return Response.json({ strategyReady: true, marketMode: "scheduled_noon", signalDate: today, snapshotTime: "11:30", baseAsOf: baseline.bars.at(-1)?.date, snapshot, dataset: baseline.dataset, cached: false });
+    }
+  } else {
+    await saveIssues(runId, [{ code: "NOON_SOURCE_UNAVAILABLE", severity: "error", message: "A verified noon snapshot requires both independent minute sources." }]);
+  }
+  await finishRun(runId, "failed");
+  const rejected = sources.filter((source) => source.status === "error");
+  let alertDelivery: unknown;
+  if (notifyOnSourceFailure) {
+    try {
+      alertDelivery = await deliverFeishuMarketDataFailureAlert({ symbol, shanghaiDate: today, runId, failedSources: rejected.length ? rejected.map((source) => ({ provider: source.provider, message: source.message ?? "upstream failure", attempts: source.attempts, code: source.code, cause: source.cause })) : [{ provider: "cross-validation", message: validation?.issues.map((issue) => issue.message).join("; ") ?? "Noon validation failed" }], successfulSources: sources.filter((source) => source.status === "ok").map((source) => source.provider), lastVerified: { version: baseline.dataset.version, asOf: baseline.bars.at(-1)?.date ?? baseline.dataset.createdAt } });
+    } catch (error) { alertDelivery = { sent: false, status: "failed", error: message(error) }; }
+  }
+  return Response.json({ code: "NOON_SNAPSHOT_UNAVAILABLE", error: "当天 11:30 午盘快照未能完成双源验证，正常策略卡已暂停。", strategyReady: false, marketMode: "scheduled_noon", signalDate: today, snapshotTime: "11:30", baseAsOf: baseline.bars.at(-1)?.date, runId, sources, alertDelivery }, { status: 502 });
+}
+
 export async function POST(request: Request) {
   if (!trustedLocalJsonRequest(request)) {
     return Response.json({ code: "LOCAL_JSON_ONLY", error: "行情同步只允许本机页面或本机调度器发起 JSON 请求" }, { status: 403 });
@@ -64,16 +116,19 @@ export async function POST(request: Request) {
   let days: number;
   let completeOnly: boolean;
   let purpose: "scheduled" | undefined;
+  let mode: "scheduled_noon" | undefined;
   let notifyOnSourceFailure = false;
   try {
-    const payload = await request.json() as { symbol?: unknown; days?: unknown; completeOnly?: unknown; purpose?: unknown; notifyOnSourceFailure?: unknown };
+    const payload = await request.json() as { symbol?: unknown; days?: unknown; completeOnly?: unknown; purpose?: unknown; mode?: unknown; notifyOnSourceFailure?: unknown };
     symbol = normalizeSymbol(payload.symbol).symbol;
     days = normalizeDays(payload.days);
     if (payload.completeOnly !== undefined && typeof payload.completeOnly !== "boolean") throw new Error("completeOnly must be a boolean");
     if (payload.purpose !== undefined && payload.purpose !== "scheduled") throw new Error("purpose only supports scheduled");
+    if (payload.mode !== undefined && payload.mode !== "scheduled_noon") throw new Error("mode only supports scheduled_noon");
     if (payload.notifyOnSourceFailure !== undefined && typeof payload.notifyOnSourceFailure !== "boolean") throw new Error("notifyOnSourceFailure must be a boolean");
     completeOnly = payload.completeOnly === true;
     purpose = payload.purpose === "scheduled" ? "scheduled" : undefined;
+    mode = payload.mode === "scheduled_noon" ? "scheduled_noon" : undefined;
     notifyOnSourceFailure = payload.notifyOnSourceFailure === true;
   } catch (error) {
     return Response.json({ code: "INVALID_REQUEST", error: message(error) }, { status: 400 });
@@ -82,6 +137,10 @@ export async function POST(request: Request) {
 
   try {
     await ensureMarketSchema();
+    if (mode === "scheduled_noon") {
+      if (purpose !== "scheduled") return Response.json({ code: "INVALID_REQUEST", error: "scheduled_noon requires purpose: scheduled" }, { status: 400 });
+      return syncScheduledNoon(symbol, days, notifyOnSourceFailure);
+    }
     const cached = await getLatestDataset(symbol, days);
     // A requested lookback can predate the instrument's listing. Treat at
     // least 90% coverage as a complete fresh cache instead of refetching the
